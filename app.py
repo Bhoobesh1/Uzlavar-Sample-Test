@@ -1,0 +1,199 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import PyPDF2
+import faiss
+import numpy as np
+from openai import OpenAI
+import os
+
+# ---------------- APP SETUP ----------------
+app = Flask(__name__)
+CORS(app)   # 🔴 VERY IMPORTANT for WordPress connection
+
+client = OpenAI()
+
+chunks = []
+index = None
+
+# ----------- CHAT MEMORY ----------- #
+conversation_memory = []
+MAX_MEMORY = 6
+
+# ---------------- SMALL TALK ----------------
+def handle_small_talk(user_input, language):
+    text = user_input.lower().strip()
+
+    greetings = [
+        "hi", "hello", "hey",
+        "good morning", "good afternoon", "good evening"
+    ]
+
+    closing = [
+        "bye", "thank you", "thanks",
+        "ok thank you", "ok thanks", "that's all"
+    ]
+
+    for g in greetings:
+        if text == g or text.startswith(g):
+            if language == "tamil":
+                return "உழவர் சந்தை பைவேட் லிமிடெட் 🌾 வரவேற்கிறோம். நான் உங்களுக்கு எப்படி உதவலாம்?"
+            else:
+                return "Welcome to Uzhavar Sandhai Pvt Ltd 🌾 How can I help you?"
+
+    for c in closing:
+        if c in text:
+            if language == "tamil":
+                return "நன்றி 😊 எப்போது வேண்டுமானாலும் கேளுங்கள்."
+            else:
+                return "You're welcome 😊 Feel free to ask anytime."
+
+    return None
+
+# ---------------- CHUNKING ----------------
+def make_chunks(text, chunk_size=500, overlap=100):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return chunks
+
+# ---------------- EMBEDDINGS ----------------
+def get_embeddings(chunks):
+    embeddings = []
+    for chunk in chunks:
+        response = client.embeddings.create(
+            input=chunk,
+            model="text-embedding-3-small"
+        )
+        embeddings.append(response.data[0].embedding)
+
+    return np.array(embeddings).astype("float32")
+
+def build_faiss_index(embeddings):
+    dimension = embeddings.shape[1]
+    idx = faiss.IndexFlatL2(dimension)
+    idx.add(embeddings)
+    return idx
+
+# ---------------- LOAD PDF ----------------
+def load_default_pdf(pdf_path):
+    global chunks, index, conversation_memory
+
+    conversation_memory = []
+
+    if not os.path.exists(pdf_path):
+        print("❌ PDF file not found:", pdf_path)
+        return
+
+    with open(pdf_path, "rb") as f:
+        reader = PyPDF2.PdfReader(f)
+        text = ""
+
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text
+
+    if not text.strip():
+        print("❌ No readable text in PDF")
+        return
+
+    chunks = make_chunks(text)
+    embeddings = get_embeddings(chunks)
+    index = build_faiss_index(embeddings)
+
+    print("✅ PDF loaded & FAISS index built")
+
+# ---------------- ASK API ----------------
+@app.route("/ask", methods=["POST"])
+def ask():
+    global conversation_memory
+
+    data = request.json
+    question = data.get("question", "").strip()
+    language = data.get("language", "english")
+
+    if not question:
+        return jsonify({"answer": "Please ask a question."})
+
+    # Small talk
+    small_talk = handle_small_talk(question, language)
+    if small_talk:
+        return jsonify({"answer": small_talk})
+
+    if index is None:
+        return jsonify({"answer": "Document not loaded."})
+
+    # Embed question
+    q_embed = client.embeddings.create(
+        input=question,
+        model="text-embedding-3-small"
+    ).data[0].embedding
+
+    q_embed = np.array([q_embed]).astype("float32")
+
+    distances, indices = index.search(q_embed, 3)
+    context = "\n\n".join([chunks[i] for i in indices[0]])
+
+    # Conversation memory
+    memory_text = ""
+    for m in conversation_memory:
+        memory_text += f"User: {m['question']}\nAssistant: {m['answer']}\n\n"
+
+    # Language control
+    if language == "tamil":
+        language_instruction = """
+Answer ONLY in Tamil.
+If user types in Tanglish, respond in proper Tamil.
+Use simple and polite Tamil.
+"""
+    else:
+        language_instruction = "Answer ONLY in English."
+
+    prompt = f"""
+You are a helpful assistant for Uzhavar Sandhai Pvt Ltd.
+
+{language_instruction}
+
+Previous conversation:
+{memory_text}
+
+Answer the question using ONLY the context below.
+
+Context:
+{context}
+
+Question:
+{question}
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3
+    )
+
+    answer = response.choices[0].message.content.strip()
+
+    conversation_memory.append({
+        "question": question,
+        "answer": answer
+    })
+
+    if len(conversation_memory) > MAX_MEMORY:
+        conversation_memory.pop(0)
+
+    return jsonify({"answer": answer})
+
+# ---------------- HEALTH CHECK ----------------
+@app.route("/")
+def health():
+    return "Uzhavar Sandhai Backend is Running ✅"
+
+# ---------------- RUN ----------------
+if __name__ == "__main__":
+    load_default_pdf("data/document.pdf")
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
