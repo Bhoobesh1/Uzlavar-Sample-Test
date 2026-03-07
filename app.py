@@ -1,291 +1,281 @@
+import os
+import json
+import logging
+
+import numpy as np
+import faiss
+import PyPDF2
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import PyPDF2
-import faiss
-import numpy as np
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
-import os
 
-# ---------------- APP SETUP ----------------
+# ─────────────────────────────────────────
+# SETUP
+# ─────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
+
 app = Flask(__name__)
-CORS(app)
 
-# OpenAI Client
-client = OpenAI()
+CORS(app, origins=os.getenv("ALLOWED_ORIGINS", "*").split(","))
 
-# Load local embedding model
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Global variables
-chunks = []
-index = None
+# ─────────────────────────────────────────
+# CONFIG  (override via environment variables)
+# ─────────────────────────────────────────
+CHUNK_SIZE       = int(os.getenv("CHUNK_SIZE",           "400"))
+CHUNK_OVERLAP    = int(os.getenv("CHUNK_OVERLAP",         "50"))
+TOP_K            = int(os.getenv("TOP_K",                  "3"))
+MAX_MEMORY       = int(os.getenv("MAX_MEMORY",             "6"))
+DISTANCE_THRESH  = float(os.getenv("DISTANCE_THRESHOLD", "1.5"))
+PDF_PATH         = os.getenv("PDF_PATH",        "data/document.pdf")
+INDEX_FILE       = os.getenv("INDEX_FILE",      "faiss_index.bin")
+CHUNKS_FILE      = os.getenv("CHUNKS_FILE",     "chunks.json")
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL",     "all-MiniLM-L6-v2")
+OPENAI_MODEL     = os.getenv("OPENAI_MODEL",    "gpt-4o-mini")
 
-# Chat memory
-conversation_memory = []
-MAX_MEMORY = 6
+# ─────────────────────────────────────────
+# STATE
+# ─────────────────────────────────────────
+chunks: list[str] = []
+index: faiss.Index | None = None
+conversation_memory: list[dict] = []
 
-# Files for persistence
-INDEX_FILE = "faiss_index.bin"
-CHUNKS_FILE = "chunks.npy"
-
-# Distance threshold
-DISTANCE_THRESHOLD = 1.5
+log.info("Loading embedding model: %s", EMBED_MODEL_NAME)
+embedding_model = SentenceTransformer(EMBED_MODEL_NAME)
+log.info("Embedding model loaded.")
 
 
-# ---------------- SMALL TALK ----------------
-def handle_small_talk(user_input, language):
+# ─────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────
+def handle_small_talk(user_input: str, language: str) -> str | None:
     text = user_input.lower().strip()
 
     greetings = ["hi", "hello", "hey",
                  "good morning", "good afternoon", "good evening"]
+    closings  = ["bye", "thank you", "thanks",
+                 "ok thank you", "ok thanks", "that's all"]
 
-    closing = ["bye", "thank you", "thanks",
-               "ok thank you", "ok thanks", "that's all"]
+    if any(text == g or text.startswith(g) for g in greetings):
+        return (
+            "உழவர் சந்தை பைவேட் லிமிடெட் 🌾 வரவேற்கிறோம். நான் உங்களுக்கு எப்படி உதவலாம்?"
+            if language == "tamil"
+            else "Welcome to Uzhavar Sandhai Pvt Ltd 🌾 How can I help you?"
+        )
 
-    for g in greetings:
-        if text == g or text.startswith(g):
-            if language == "tamil":
-                return "உழவர் சந்தை பைவேட் லிமிடெட் 🌾 வரவேற்கிறோம். நான் உங்களுக்கு எப்படி உதவலாம்?"
-            else:
-                return "Welcome to Uzhavar Sandhai Pvt Ltd 🌾 How can I help you?"
-
-    for c in closing:
-        if c in text:
-            if language == "tamil":
-                return "நன்றி 😊 எப்போது வேண்டுமானாலும் கேளுங்கள்."
-            else:
-                return "You're welcome 😊 Feel free to ask anytime."
+    if any(c in text for c in closings):
+        return (
+            "நன்றி 😊 எப்போது வேண்டுமானாலும் கேளுங்கள்."
+            if language == "tamil"
+            else "You're welcome 😊 Feel free to ask anytime."
+        )
 
     return None
 
 
-# ---------------- TEXT CHUNKING ----------------
-def make_chunks(text, chunk_size=400, overlap=50):
-    result = []
-    start = 0
-
+def make_chunks(text: str) -> list[str]:
+    result, start = [], 0
     while start < len(text):
-        end = start + chunk_size
-        result.append(text[start:end])
-        start += chunk_size - overlap
-
+        result.append(text[start: start + CHUNK_SIZE])
+        start += CHUNK_SIZE - CHUNK_OVERLAP
     return result
 
 
-# ---------------- EMBEDDINGS ----------------
-def get_embeddings(text_chunks):
-
-    embeddings = embedding_model.encode(
+def get_embeddings(text_chunks: list[str]) -> np.ndarray:
+    return embedding_model.encode(
         text_chunks,
         convert_to_numpy=True,
-        show_progress_bar=True
-    )
+        show_progress_bar=False,
+        batch_size=64,
+    ).astype("float32")
 
-    return embeddings.astype("float32")
 
-
-# ---------------- BUILD FAISS ----------------
-def build_faiss_index(embeddings):
-
-    dimension = embeddings.shape[1]
-
-    idx = faiss.IndexFlatL2(dimension)
-
+def build_faiss_index(embeddings: np.ndarray) -> faiss.Index:
+    idx = faiss.IndexFlatL2(embeddings.shape[1])
     idx.add(embeddings)
-
     return idx
 
 
-# ---------------- LOAD PDF ----------------
-def load_default_pdf(pdf_path):
-
+def load_default_pdf(pdf_path: str = PDF_PATH) -> None:
     global chunks, index, conversation_memory
-
     conversation_memory = []
 
-    # Load saved FAISS index if exists
+    # ── Try loading cached index ──
     if os.path.exists(INDEX_FILE) and os.path.exists(CHUNKS_FILE):
+        log.info("Loading saved FAISS index from disk.")
+        try:
+            index = faiss.read_index(INDEX_FILE)
+            with open(CHUNKS_FILE, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+            log.info("Index loaded — %d chunks.", len(chunks))
+            return
+        except Exception as e:
+            log.warning("Failed to load saved index (%s). Rebuilding...", e)
 
-        print("Loading saved FAISS index")
-
-        index = faiss.read_index(INDEX_FILE)
-
-        chunks = np.load(CHUNKS_FILE, allow_pickle=True).tolist()
-
-        print("Index loaded successfully")
-
-        return
-
-    print("Creating embeddings from PDF")
-
+    # ── Build from PDF ──
     if not os.path.exists(pdf_path):
-
-        print("PDF not found:", pdf_path)
-
+        log.error("PDF not found: %s", pdf_path)
         return
 
+    log.info("Reading PDF: %s", pdf_path)
     text = ""
-
-    with open(pdf_path, "rb") as f:
-
-        reader = PyPDF2.PdfReader(f)
-
-        for page in reader.pages:
-
-            page_text = page.extract_text()
-
-            if page_text:
-                text += page_text
+    try:
+        with open(pdf_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text
+    except Exception as e:
+        log.error("Error reading PDF: %s", e)
+        return
 
     if not text.strip():
-
-        print("No readable text found")
-
+        log.error("No readable text extracted from PDF.")
         return
 
+    log.info("Building embeddings for %d characters of text...", len(text))
     chunks = make_chunks(text)
-
     embeddings = get_embeddings(chunks)
-
     index = build_faiss_index(embeddings)
 
-    # Save index
+    # Save index and chunks
     faiss.write_index(index, INDEX_FILE)
+    with open(CHUNKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(chunks, f, ensure_ascii=False)
 
-    np.save(CHUNKS_FILE, chunks)
-
-    print("Embeddings created and saved")
+    log.info("Embeddings built and saved — %d chunks.", len(chunks))
 
 
-# ---------------- ASK ROUTE ----------------
+# ─────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────
 @app.route("/ask", methods=["POST"])
 def ask():
-
     global conversation_memory
 
+    data     = request.get_json(silent=True) or {}
+    question = data.get("question", "").strip()
+    language = data.get("language", "english").strip().lower()
+
+    # ── Validation ──
+    if not question:
+        return jsonify({"answer": "Please ask a question."})
+    if len(question) > 500:
+        return jsonify({"answer": "Question is too long (max 500 characters)."})
+    if language not in ("english", "tamil"):
+        language = "english"
+
+    # ── Small talk ──
+    small_talk = handle_small_talk(question, language)
+    if small_talk:
+        return jsonify({"answer": small_talk})
+
+    if index is None:
+        return jsonify({"answer": "Document not loaded. Please contact support."})
+
     try:
-
-        data = request.json
-
-        question = data.get("question", "").strip()
-
-        language = data.get("language", "english")
-
-        if not question:
-            return jsonify({"answer": "Please ask a question."})
-
-        if len(question) > 500:
-            return jsonify({"answer": "Question too long."})
-
-        # Handle greetings
-        small_talk = handle_small_talk(question, language)
-
-        if small_talk:
-            return jsonify({"answer": small_talk})
-
-        if index is None:
-            return jsonify({"answer": "Document not loaded."})
-
-        # Embed question
+        # ── Retrieval ──
         q_embed = embedding_model.encode(
-            [question],
-            convert_to_numpy=True
+            [question], convert_to_numpy=True
         ).astype("float32")
 
-        distances, indices = index.search(q_embed, 3)
+        distances, indices_found = index.search(q_embed, TOP_K)
 
-        # Prevent hallucination
-        if distances[0][0] > DISTANCE_THRESHOLD:
+        if distances[0][0] > DISTANCE_THRESH:
+            msg = (
+                "மன்னிக்கவும், ஆவணத்தில் தொடர்புடைய தகவல் கிடைக்கவில்லை."
+                if language == "tamil"
+                else "Sorry, I could not find relevant information in the document."
+            )
+            return jsonify({"answer": msg})
 
-            return jsonify({
-                "answer": "Sorry, I could not find relevant information in the document."
-            })
+        context = "\n\n".join(chunks[i] for i in indices_found[0])
 
-        context = "\n\n".join([chunks[i] for i in indices[0]])
+        # ── Build prompt ──
+        memory_text = "".join(
+            f"User: {m['question']}\nAssistant: {m['answer']}\n\n"
+            for m in conversation_memory
+        )
 
-        # Conversation memory
-        memory_text = ""
+        language_instruction = (
+            "Answer ONLY in Tamil. If user types in Tanglish, respond in proper Tamil. Use simple and polite Tamil."
+            if language == "tamil"
+            else "Answer ONLY in English."
+        )
 
-        for m in conversation_memory:
-
-            memory_text += f"User: {m['question']}\nAssistant: {m['answer']}\n\n"
-
-        if language == "tamil":
-
-            language_instruction = """
-Answer ONLY in Tamil.
-If user types in Tanglish, respond in proper Tamil.
-Use simple and polite Tamil.
-"""
-
-        else:
-
-            language_instruction = "Answer ONLY in English."
-
-        prompt = f"""
-You are a helpful assistant for Uzhavar Sandhai Pvt Ltd.
+        prompt = f"""You are a helpful assistant for Uzhavar Sandhai Pvt Ltd.
 
 {language_instruction}
 
 Previous conversation:
 {memory_text}
-
-Answer the question using ONLY the context below.
+Answer the question using ONLY the context below. If the answer is not in the context, say you don't know.
 
 Context:
 {context}
 
 Question:
-{question}
-"""
+{question}"""
 
-        print("User question:", question)
+        log.info("Question [%s]: %s", language, question)
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3
+            temperature=0.3,
+            timeout=30,
         )
 
         answer = response.choices[0].message.content.strip()
 
-        conversation_memory.append({
-            "question": question,
-            "answer": answer
-        })
-
+        # ── Update memory ──
+        conversation_memory.append({"question": question, "answer": answer})
         if len(conversation_memory) > MAX_MEMORY:
             conversation_memory.pop(0)
 
         return jsonify({"answer": answer})
 
     except Exception as e:
-
-        print("Error:", e)
-
-        return jsonify({
-            "answer": "Sorry, something went wrong. Please try again."
-        })
+        log.exception("Error in /ask: %s", e)
+        return jsonify({"answer": "Sorry, something went wrong. Please try again."})
 
 
-# ---------------- RELOAD DOCUMENT ----------------
 @app.route("/reload")
 def reload_pdf():
+    token = request.args.get("token", "")
+    if os.getenv("RELOAD_SECRET") and token != os.getenv("RELOAD_SECRET"):
+        return jsonify({"error": "Unauthorized"}), 401
 
-    load_default_pdf("data/document.pdf")
+    load_default_pdf()
+    return jsonify({"status": "Document reloaded successfully", "chunks": len(chunks)})
 
-    return {"status": "Document reloaded successfully"}
 
-
-# ---------------- HEALTH CHECK ----------------
-@app.route("/")
+@app.route("/health")
 def health():
+    return jsonify({
+        "status": "ok",
+        "chunks_loaded": len(chunks),
+        "index_ready": index is not None,
+    })
 
-    return "Uzhavar Sandhai Backend is Running"
+
+@app.route("/")
+def root():
+    return "Uzhavar Sandhai Backend is Running ✅"
 
 
+# ─────────────────────────────────────────
+# ENTRY POINT  (dev only — use Gunicorn in prod)
+# ─────────────────────────────────────────
 if __name__ == "__main__":
-    load_default_pdf("data/document.pdf")
+    load_default_pdf()
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)
