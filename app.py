@@ -197,7 +197,7 @@ def ask():
 
         # Prevent hallucination
         if distances[0][0] > DISTANCE_THRESHOLD:
-            
+
             return jsonify({
                 "answer": "Sorry, I could not find relevant information in the document."
             })
@@ -285,5 +285,7 @@ def health():
     return "Uzhavar Sandhai Backend is Running"
 
 
-# ---------------- STARTUP ----------------
-load_default_pdf("data/document.pdf")
+if __name__ == "__main__":
+    load_default_pdf("data/document.pdf")
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
